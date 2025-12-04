@@ -160,32 +160,7 @@ class PortainerDataUpdateCoordinator(DataUpdateCoordinator):
                 stack_name = stack.get("Name")
                 if stack_name:
                     self.stacks[stack_name] = stack
-            
-            # Check for updates if update sensors are enabled (but don't block initial load)
-            if self.is_update_sensors_enabled():
-                # Only check updates every 5 minutes to avoid performance issues
-                import time
-                current_time = time.time()
-                last_update_check = getattr(self, '_last_update_check', 0)
-                
-                if current_time - last_update_check > 300:  # 5 minutes
-                    _LOGGER.debug("🔍 Checking for container updates...")
-                    self.update_availability = {}
-                    # Check updates for each container (this could be optimized further)
-                    for container_id in self.containers:
-                        try:
-                            has_updates = await self.api.images.check_image_updates(self.endpoint_id, container_id)
-                            self.update_availability[container_id] = has_updates
-                        except Exception as e:
-                            _LOGGER.debug("⚠️ Could not check updates for container %s: %s", container_id, e)
-                            self.update_availability[container_id] = False
-                    self._last_update_check = current_time
-                else:
-                    # Keep existing update availability data
-                    if not hasattr(self, 'update_availability'):
-                        self.update_availability = {}
-            else:
-                self.update_availability = {}
+        
             
             # Resource metrics aggregation
             self.metrics = {}
@@ -234,54 +209,6 @@ class PortainerDataUpdateCoordinator(DataUpdateCoordinator):
                 
                 await asyncio.gather(*(compute_metrics(cid, cdata) for cid, cdata in self.containers.items()))
 
-            # Image/version metadata aggregation
-            self.image_data = {}
-            if self.is_version_sensors_enabled():
-                sem_img = asyncio.Semaphore(4)
-
-                async def compute_image_data(container_id: str) -> None:
-                    async with sem_img:
-                        data: Dict[str, Any] = {}
-                        try:
-                            info = await self.api.inspect_container(self.endpoint_id, container_id)
-                            if not info:
-                                return
-                            image_name = (info.get("Config", {}) or {}).get("Image")
-                            image_id = info.get("Image")
-                            if image_name:
-                                data["image_name"] = image_name
-                            if image_id:
-                                image_info = await self.api.get_image_info(self.endpoint_id, image_id)
-                                if image_info:
-                                    try:
-                                        data["current_version"] = self.api.extract_version_from_image(image_info)
-                                    except Exception:
-                                        pass
-                            try:
-                                current_digest = await self.api.get_current_digest(self.endpoint_id, container_id)
-                                if current_digest and current_digest != "unknown":
-                                    data["current_digest"] = current_digest
-                            except Exception:
-                                pass
-                            if self.is_update_sensors_enabled() and image_name:
-                                try:
-                                    available_version = await self.api.get_available_version(self.endpoint_id, image_name)
-                                    if available_version:
-                                        data["available_version"] = available_version
-                                except Exception:
-                                    pass
-                                try:
-                                    available_digest = await self.api.get_available_digest(self.endpoint_id, container_id)
-                                    if available_digest and available_digest != "unknown":
-                                        data["available_digest"] = available_digest
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            _LOGGER.debug("⚠️ Failed to compute image data for %s: %s", container_id, e)
-                        if data:
-                            self.image_data[container_id] = data
-
-                await asyncio.gather(*(compute_image_data(cid) for cid in self.containers.keys()))
             
             _LOGGER.info("✅ Updated Portainer data: %d containers (%d stack, %d standalone), %d stacks", 
                         len(self.containers), stack_containers_count, standalone_containers_count, len(self.stacks))
@@ -347,11 +274,11 @@ class PortainerDataUpdateCoordinator(DataUpdateCoordinator):
 
     def is_version_sensors_enabled(self) -> bool:
         """Check if version sensors are enabled."""
-        return self.config.get("enable_version_sensors", False)
+        return False
 
     def is_update_sensors_enabled(self) -> bool:
         """Check if update sensors are enabled."""
-        return self.config.get("enable_update_sensors", False)
+        return False
 
     def is_stack_buttons_enabled(self) -> bool:
         """Check if stack buttons are enabled."""

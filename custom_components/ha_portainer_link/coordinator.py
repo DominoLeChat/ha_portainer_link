@@ -270,7 +270,7 @@ class PortainerDataUpdateCoordinator(DataUpdateCoordinator):
 
     def is_resource_sensors_enabled(self) -> bool:
         """Check if resource sensors are enabled."""
-        return self.config.get("enable_resource_sensors", False)
+        return True
 
     def is_version_sensors_enabled(self) -> bool:
         """Check if version sensors are enabled."""

@@ -1,14 +1,13 @@
 import logging
 import hashlib
-from homeassistant.helpers.entity import Entity
+
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import STATE_UNKNOWN
-from homeassistant.helpers import entity_registry as er
+
 from .const import DOMAIN
-from .portainer_api import PortainerAPI
 
 _LOGGER = logging.getLogger(__name__)
-
-_LOGGER.info("Loaded Portainer sensor integration.")
 
 def _build_stable_unique_id(entry_id, endpoint_id, container_name, stack_info, suffix):
     if stack_info.get("is_stack_container"):
@@ -22,7 +21,6 @@ def _build_stable_unique_id(entry_id, endpoint_id, container_name, stack_info, s
     return f"entry_{entry_id}_endpoint_{endpoint_id}_{sanitized}_{suffix}"
 
 def _get_host_display_name(base_url):
-    """Extract a clean host name from the base URL for display purposes."""
     host = base_url.replace("https://", "http://").replace("http://", "")
     host = host.rstrip("/")
     for port in [":9000", ":9443", ":80", ":443"]:
@@ -39,151 +37,59 @@ def _get_host_display_name(base_url):
             return host
 
 def _get_host_hash(base_url):
-    """Generate a short hash of the host URL for unique identification."""
     return hashlib.md5(base_url.encode()).hexdigest()[:8]
 
 async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up Portainer sensors using the coordinator."""
+    coordinator = hass.data[DOMAIN][entry.entry_id]
     config = entry.data
-    host = config["host"]
-    username = config.get("username")
-    password = config.get("password")
-    api_key = config.get("api_key")
     endpoint_id = config["endpoint_id"]
     entry_id = entry.entry_id
 
-    _LOGGER.info("🚀 Setting up HA Portainer Link sensors for entry %s (endpoint %s)", entry_id, endpoint_id)
-    
-    host_display_name = _get_host_display_name(host)
-    _LOGGER.info("🏷️ Extracted host display name: %s", host_display_name)
+    # On attend que le coordinateur ait récupéré les premières données
+    # pour être sûr d'avoir la liste des conteneurs
+    if not coordinator.data:
+        await coordinator.async_config_entry_first_refresh()
 
-    api = PortainerAPI(host, username, password, api_key)
-    await api.initialize()
-
-    containers = await api.get_containers(endpoint_id)
-    _LOGGER.info("📦 Found %d containers to process", len(containers))
+    containers = coordinator.data.get("containers", {})
+    _LOGGER.info("📦 Sensor setup: Found %d containers in coordinator data", len(containers))
 
     entities = []
-    stack_containers_count = 0
-    standalone_containers_count = 0
-
-    # Migrate existing entities to stable unique_ids
-    try:
-        er_registry = er.async_get(hass)
-        for container in containers:
-            name = container.get("Names", ["unknown"])[0].strip("/")
-            container_id = container["Id"]
-            container_info = await api.inspect_container(endpoint_id, container_id)
-            stack_info = api.get_container_stack_info(container_info) if container_info else {"is_stack_container": False}
-            
-            # Removed version sensors from suffixes list
-            suffixes = [
-                ("status", "sensor"),
-                ("cpu_usage", "sensor"),
-                ("memory_usage", "sensor"),
-                ("uptime", "sensor"),
-                ("image", "sensor"),
-            ]
-            
-            for suffix, domain_name in suffixes:
-                old_uid = f"entry_{entry_id}_endpoint_{endpoint_id}_{container_id}_{suffix}"
-                new_uid = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, suffix)
-                
-                if old_uid == new_uid:
-                    continue
-                    
-                ent_id = er_registry.async_get_entity_id(domain_name, DOMAIN, old_uid)
-                if ent_id:
-                    try:
-                        er_registry.async_update_entity(ent_id, new_unique_id=new_uid)
-                        _LOGGER.debug("Migrated %s unique_id: %s -> %s", ent_id, old_uid, new_uid)
-                    except Exception as e:
-                        _LOGGER.debug("Could not migrate %s: %s", ent_id, e)
-
-    except Exception as e:
-        _LOGGER.debug("Entity registry migration skipped/failed: %s", e)
-
-    for container in containers:
-        name = container.get("Names", ["unknown"])[0].strip("/")
-        container_id = container["Id"]
-        state = container.get("State", STATE_UNKNOWN)
-        
-        _LOGGER.debug("🔍 Processing container: %s (ID: %s, State: %s)", name, container_id, state)
-        
-        container_info = await api.inspect_container(endpoint_id, container_id)
-        stack_info = api.get_container_stack_info(container_info) if container_info else {"is_stack_container": False}
-        
-        if stack_info.get("is_stack_container"):
-            stack_containers_count += 1
-        else:
-            standalone_containers_count += 1
-
-        entities.append(ContainerStatusSensor(name, state, api, endpoint_id, container_id, stack_info, entry_id))
-        entities.append(ContainerCPUSensor(name, api, endpoint_id, container_id, stack_info, entry_id))
-        entities.append(ContainerMemorySensor(name, api, endpoint_id, container_id, stack_info, entry_id))
-        entities.append(ContainerUptimeSensor(name, api, endpoint_id, container_id, stack_info, entry_id))
-        entities.append(ContainerImageSensor(name, container, api, endpoint_id, container_id, stack_info, entry_id))
-        # Version sensors removed here
-
-    _LOGGER.info("✅ Created %d entities (%d stack containers, %d standalone containers)", 
-                 len(entities), stack_containers_count, standalone_containers_count)
     
-    async_add_entities(entities, update_before_add=True)
+    # Pour chaque conteneur trouvé dans le coordinateur
+    for container_id, container_data in containers.items():
+        name = container_data.get("Names", ["unknown"])[0].strip("/")
+        
+        # On récupère les infos de stack déjà calculées par le coordinateur
+        # (plus besoin de refaire un appel API inspect_container ici !)
+        stack_info = coordinator.container_stack_info.get(container_id, {"is_stack_container": False})
+
+        # Création des entités liées au coordinateur
+        entities.append(ContainerStatusSensor(coordinator, name, endpoint_id, container_id, stack_info, entry_id))
+        entities.append(ContainerCPUSensor(coordinator, name, endpoint_id, container_id, stack_info, entry_id))
+        entities.append(ContainerMemorySensor(coordinator, name, endpoint_id, container_id, stack_info, entry_id))
+        entities.append(ContainerUptimeSensor(coordinator, name, endpoint_id, container_id, stack_info, entry_id))
+        entities.append(ContainerImageSensor(coordinator, name, endpoint_id, container_id, stack_info, entry_id))
+
+    async_add_entities(entities)
 
 
-class BaseContainerSensor(Entity):
-    """Base class for all container sensors."""
-    def __init__(self, container_name, container_id, api, endpoint_id, stack_info, entry_id):
+class BaseContainerSensor(CoordinatorEntity, SensorEntity):
+    """Base class for all container sensors that follows the coordinator."""
+    
+    def __init__(self, coordinator, container_name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator)
         self._container_name = container_name
         self._container_id = container_id
-        self._api = api
         self._endpoint_id = endpoint_id
         self._stack_info = stack_info
         self._entry_id = entry_id
-
-    async def _find_current_container_id(self):
-        try:
-            containers = await self._api.get_containers(self._endpoint_id)
-            if not containers:
-                return None
-                
-            if self._stack_info.get("is_stack_container"):
-                expected_stack = self._stack_info.get("stack_name")
-                expected_service = self._stack_info.get("service_name")
-                
-                for container in containers:
-                    labels = container.get("Labels", {}) or {}
-                    if (labels.get("com.docker.compose.project") == expected_stack and 
-                        labels.get("com.docker.compose.service") == expected_service):
-                        return container.get("Id")
-            
-            for container in containers:
-                names = container.get("Names", []) or []
-                if not names:
-                    continue
-                name = names[0].strip("/")
-                if name == self._container_name:
-                    return container.get("Id")
-            
-            return None
-        except Exception:
-            return None
-
-    async def _ensure_container_bound(self) -> None:
-        try:
-            info = await self._api.get_container_info(self._endpoint_id, self._container_id)
-            if not info or not isinstance(info, dict) or not info.get("Id"):
-                new_id = await self._find_current_container_id()
-                if new_id and new_id != self._container_id:
-                    self._container_id = new_id
-        except Exception:
-            new_id = await self._find_current_container_id()
-            if new_id and new_id != self._container_id:
-                self._container_id = new_id
+        self._api_url = coordinator.api.base_url
 
     @property
     def device_info(self):
-        host_name = _get_host_display_name(self._api.base_url)
-        host_hash = _get_host_hash(self._api.base_url)
+        host_name = _get_host_display_name(self._api_url)
+        host_hash = _get_host_hash(self._api_url)
         
         if self._stack_info.get("is_stack_container"):
             stack_name = self._stack_info.get("stack_name", "unknown_stack")
@@ -193,7 +99,7 @@ class BaseContainerSensor(Entity):
                 "name": f"Stack: {stack_name} ({host_name})",
                 "manufacturer": "Docker via Portainer",
                 "model": "Docker Stack",
-                "configuration_url": f"{self._api.base_url}/#!/stacks/{stack_name}",
+                "configuration_url": f"{self._api_url}/#!/stacks/{stack_name}",
             }
         else:
             device_id = f"entry_{self._entry_id}_endpoint_{self._endpoint_id}_container_{self._container_id}_{host_hash}_{host_name.replace('.', '_').replace(':', '_')}"
@@ -202,167 +108,103 @@ class BaseContainerSensor(Entity):
                 "name": f"{self._container_name} ({host_name})",
                 "manufacturer": "Docker via Portainer",
                 "model": "Docker Container",
-                "configuration_url": f"{self._api.base_url}/#!/containers/{self._container_id}/details",
+                "configuration_url": f"{self._api_url}/#!/containers/{self._container_id}/details",
             }
+            
+    @property
+    def available(self) -> bool:
+        """Entity is available if coordinator is successful and container is in the list."""
+        return (
+            super().available 
+            and "containers" in self.coordinator.data 
+            and self._container_id in self.coordinator.data["containers"]
+        )
 
 class ContainerStatusSensor(BaseContainerSensor):
-    def __init__(self, name, state, api, endpoint_id, container_id, stack_info, entry_id):
-        super().__init__(name, container_id, api, endpoint_id, stack_info, entry_id)
+    def __init__(self, coordinator, name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator, name, endpoint_id, container_id, stack_info, entry_id)
         self._attr_name = f"{name} Status"
         self._attr_unique_id = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, "status")
-        self._state = state
 
     @property
-    def state(self):
-        return self._state or STATE_UNKNOWN
+    def native_value(self):
+        container = self.coordinator.data["containers"].get(self._container_id, {})
+        # Gestion robuste des formats d'état (dict ou str)
+        state_obj = container.get("State", {})
+        if isinstance(state_obj, dict):
+            return state_obj.get("Status", STATE_UNKNOWN)
+        return STATE_UNKNOWN
 
     @property
     def icon(self):
+        val = self.native_value
         return {
             "running": "mdi:docker",
             "exited": "mdi:close-circle",
             "paused": "mdi:pause-circle",
-        }.get(self._state, "mdi:help-circle")
-
-    async def async_update(self):
-        try:
-            await self._ensure_container_bound()
-            container_info = await self._api.get_container_info(self._endpoint_id, self._container_id)
-            if container_info:
-                self._state = container_info.get("State", {}).get("Status", STATE_UNKNOWN)
-            else:
-                self._state = STATE_UNKNOWN
-        except Exception as e:
-            _LOGGER.warning("Failed to get status for %s: %s", self._attr_name, e)
-            self._state = STATE_UNKNOWN
+        }.get(val, "mdi:help-circle")
 
 class ContainerCPUSensor(BaseContainerSensor):
-    def __init__(self, name, api, endpoint_id, container_id, stack_info, entry_id):
-        super().__init__(name, container_id, api, endpoint_id, stack_info, entry_id)
+    def __init__(self, coordinator, name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator, name, endpoint_id, container_id, stack_info, entry_id)
         self._attr_name = f"{name} CPU Usage"
         self._attr_unique_id = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, "cpu_usage")
-        self._state = STATE_UNKNOWN
+        self._attr_native_unit_of_measurement = "%"
+        self._attr_icon = "mdi:cpu-64-bit"
 
     @property
-    def state(self):
-        return self._state
-
-    @property
-    def unit_of_measurement(self):
-        return "%"
-
-    @property
-    def icon(self):
-        return "mdi:cpu-64-bit"
-
-    async def async_update(self):
-        await self._ensure_container_bound()
-        try:
-            stats = await self._api.get_container_stats(self._endpoint_id, self._container_id)
-            cpu_usage = stats["cpu_stats"]["cpu_usage"]["total_usage"]
-            precpu_usage = stats["precpu_stats"]["cpu_usage"]["total_usage"]
-            system_cpu = stats["cpu_stats"]["system_cpu_usage"]
-            pre_system_cpu = stats["precpu_stats"]["system_cpu_usage"]
-            
-            cpu_delta = cpu_usage - precpu_usage
-            system_delta = system_cpu - pre_system_cpu
-            cpu_count = stats.get("cpu_stats", {}).get("online_cpus", 1)
-
-            usage = (cpu_delta / system_delta) * cpu_count * 100.0 if system_delta > 0 else 0
-            self._state = round(usage, 2)
-        except Exception:
-            self._state = STATE_UNKNOWN
+    def native_value(self):
+        # Lecture directe depuis les métriques calculées par le coordinateur
+        metrics = self.coordinator.metrics.get(self._container_id, {})
+        return metrics.get("cpu_percent", STATE_UNKNOWN)
 
 class ContainerMemorySensor(BaseContainerSensor):
-    def __init__(self, name, api, endpoint_id, container_id, stack_info, entry_id):
-        super().__init__(name, container_id, api, endpoint_id, stack_info, entry_id)
+    def __init__(self, coordinator, name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator, name, endpoint_id, container_id, stack_info, entry_id)
         self._attr_name = f"{name} Memory Usage"
         self._attr_unique_id = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, "memory_usage")
-        self._state = STATE_UNKNOWN
+        self._attr_native_unit_of_measurement = "MB"
+        self._attr_icon = "mdi:memory"
 
     @property
-    def state(self):
-        return self._state
-
-    @property
-    def unit_of_measurement(self):
-        return "MB"
-
-    @property
-    def icon(self):
-        return "mdi:memory"
-
-    async def async_update(self):
-        await self._ensure_container_bound()
-        try:
-            stats = await self._api.get_container_stats(self._endpoint_id, self._container_id)
-            mem_bytes = stats["memory_stats"]["usage"]
-            self._state = round(mem_bytes / (1024 * 1024), 2)
-        except Exception:
-            self._state = STATE_UNKNOWN
+    def native_value(self):
+        metrics = self.coordinator.metrics.get(self._container_id, {})
+        return metrics.get("memory_mb", STATE_UNKNOWN)
 
 class ContainerUptimeSensor(BaseContainerSensor):
-    def __init__(self, name, api, endpoint_id, container_id, stack_info, entry_id):
-        super().__init__(name, container_id, api, endpoint_id, stack_info, entry_id)
+    def __init__(self, coordinator, name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator, name, endpoint_id, container_id, stack_info, entry_id)
         self._attr_name = f"{name} Uptime"
         self._attr_unique_id = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, "uptime")
-        self._state = STATE_UNKNOWN
+        self._attr_icon = "mdi:clock-outline"
 
     @property
-    def state(self):
-        return self._state
-
-    @property
-    def icon(self):
-        return "mdi:clock-outline"
-
-    async def async_update(self):
-        await self._ensure_container_bound()
-        try:
-            container_info = await self._api.get_container_info(self._endpoint_id, self._container_id)
-            started_at = container_info["State"]["StartedAt"]
+    def native_value(self):
+        metrics = self.coordinator.metrics.get(self._container_id, {})
+        uptime_s = metrics.get("uptime_s")
+        
+        if uptime_s is None:
+            return "Not started"
             
-            if started_at and started_at != "0001-01-01T00:00:00Z":
-                from datetime import datetime, timezone
-                dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
-                now = datetime.now(timezone.utc)
-                diff = now - dt.replace(tzinfo=timezone.utc)
-                
-                if diff.days > 0:
-                    self._state = f"{diff.days} days ago"
-                elif diff.seconds > 3600:
-                    self._state = f"{diff.seconds // 3600} hours ago"
-                elif diff.seconds > 60:
-                    self._state = f"{diff.seconds // 60} minutes ago"
-                else:
-                    self._state = "Just started"
-            else:
-                self._state = "Not started"
-        except Exception:
-            self._state = STATE_UNKNOWN
+        # Conversion simple en texte lisible
+        if uptime_s > 86400:
+            return f"{uptime_s // 86400} days ago"
+        elif uptime_s > 3600:
+            return f"{uptime_s // 3600} hours ago"
+        elif uptime_s > 60:
+            return f"{uptime_s // 60} minutes ago"
+        else:
+            return "Just started"
 
 class ContainerImageSensor(BaseContainerSensor):
-    def __init__(self, name, container_data, api, endpoint_id, container_id, stack_info, entry_id):
-        super().__init__(name, container_id, api, endpoint_id, stack_info, entry_id)
+    def __init__(self, coordinator, name, endpoint_id, container_id, stack_info, entry_id):
+        super().__init__(coordinator, name, endpoint_id, container_id, stack_info, entry_id)
         self._attr_name = f"{name} Image"
         self._attr_unique_id = _build_stable_unique_id(entry_id, endpoint_id, name, stack_info, "image")
-        self._state = container_data.get("Image", STATE_UNKNOWN)
+        self._attr_icon = "mdi:docker"
 
     @property
-    def state(self):
-        return self._state
-
-    @property
-    def icon(self):
-        return "mdi:docker"
-
-    async def async_update(self):
-        try:
-            await self._ensure_container_bound()
-            container_info = await self._api.get_container_info(self._endpoint_id, self._container_id)
-            if container_info:
-                self._state = container_info.get("Config", {}).get("Image", STATE_UNKNOWN)
-            else:
-                self._state = STATE_UNKNOWN
-        except Exception:
-            self._state = STATE_UNKNOWN
+    def native_value(self):
+        container = self.coordinator.data["containers"].get(self._container_id, {})
+        # On préfère l'info de config si dispo, sinon l'image ID brute
+        return container.get("Image", STATE_UNKNOWN)
